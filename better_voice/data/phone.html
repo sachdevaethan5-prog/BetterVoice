@@ -1,0 +1,187 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Better Voice Recorder</title>
+<style>
+/* One screen, thumb-first: progress up top, the sentence big in the middle, one large
+   record button at the bottom where a thumb rests. Violet matches the Better Voice app. */
+:root {
+  --bg: #f7f6fb; --surface: #ffffff; --ink: #1b1726; --muted: #6b6580; --line: #e3e0ec;
+  --accent: #7c3aed; --accent-soft: #ede7fd; --rec: #e11d48; --ok: #0f9d58; --warn: #b45309;
+  --font: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+  --read: Georgia, "Iowan Old Style", "Times New Roman", serif;
+  color-scheme: light;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #14121b; --surface: #1d1a27; --ink: #f1eef9; --muted: #a49db8; --line: #2e2a3b;
+    --accent: #a78bfa; --accent-soft: #2a2340; --rec: #fb7185; --ok: #34d399; --warn: #fbbf24;
+    color-scheme: dark;
+  }
+}
+* { box-sizing: border-box; }
+html, body { height: 100%; }
+body {
+  margin: 0; background: var(--bg); color: var(--ink); font: 16px/1.45 var(--font);
+  display: flex; flex-direction: column; padding: env(safe-area-inset-top, 0px) 16px env(safe-area-inset-bottom, 0px);
+}
+header { display: flex; align-items: center; gap: 12px; padding-block: 14px 8px; }
+header b { font-size: 15px; letter-spacing: 0.01em; }
+.meter { flex: 1; height: 6px; border-radius: 3px; background: var(--line); overflow: hidden; }
+.meter i { display: block; height: 100%; width: 0; background: var(--accent); transition: width 0.3s; }
+.mins { font-size: 13px; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+main { flex: 1; display: flex; flex-direction: column; justify-content: center; gap: 14px; min-height: 0; }
+.label { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--muted); }
+#sentence {
+  font: 600 clamp(24px, 7vw, 34px)/1.3 var(--read); text-wrap: balance; margin: 0;
+  overflow-wrap: anywhere;
+}
+#status { min-height: 1.45em; color: var(--muted); font-size: 15px; }
+#status.ok { color: var(--ok); } #status.warn { color: var(--warn); } #status.err { color: var(--rec); }
+.level { height: 4px; border-radius: 2px; background: var(--line); overflow: hidden; }
+.level i { display: block; height: 100%; width: 0; background: var(--rec); }
+footer { display: flex; flex-direction: column; align-items: center; gap: 14px; padding-block: 12px 22px; }
+#rec {
+  width: 112px; height: 112px; border-radius: 50%; border: 0; cursor: pointer;
+  background: var(--accent); color: #fff; font: 600 16px var(--font);
+  box-shadow: 0 6px 22px color-mix(in srgb, var(--accent) 35%, transparent);
+  -webkit-tap-highlight-color: transparent; touch-action: manipulation;
+}
+#rec.on { background: var(--rec); box-shadow: 0 0 0 10px color-mix(in srgb, var(--rec) 22%, transparent); }
+#rec:disabled { opacity: 0.5; }
+#rec:focus-visible, .small:focus-visible { outline: 3px solid var(--accent); outline-offset: 3px; }
+.row { display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; }
+.small {
+  border: 1px solid var(--line); background: var(--surface); color: var(--ink); border-radius: 999px;
+  padding: 9px 16px; font: 500 15px var(--font); cursor: pointer;
+}
+.small:disabled { opacity: 0.45; }
+@media (prefers-reduced-motion: reduce) { .meter i { transition: none; } }
+</style>
+</head>
+<body>
+<header>
+  <b>Better Voice</b>
+  <div class="meter" aria-hidden="true"><i id="bar"></i></div>
+  <span class="mins" id="mins">…</span>
+</header>
+<main>
+  <span class="label">Read this out loud</span>
+  <p id="sentence">Loading…</p>
+  <div class="level" aria-hidden="true"><i id="level"></i></div>
+  <div id="status" aria-live="polite">Tap Record, read the sentence the way you'd normally talk, then tap Stop.</div>
+</main>
+<footer>
+  <button id="rec" type="button">Record</button>
+  <div class="row">
+    <button class="small" id="skip" type="button">Skip</button>
+    <button class="small" id="redo" type="button" disabled>Redo last</button>
+  </div>
+</footer>
+<script>
+(() => {
+  // The page is served at /<secret>/, so every request stays under that path.
+  const base = location.pathname.replace(/\/?$/, "/");
+  const GOAL_MIN = 30;
+  const $ = (id) => document.getElementById(id);
+  const S = { sentence: "", recording: false, ctx: null, stream: null, node: null, frames: [], rate: 48000, last: null, busy: false, wake: null };
+
+  function status(text, kind) { const s = $("status"); s.textContent = text; s.className = kind || ""; }
+  function show(state) {
+    S.sentence = state.sentence || "";
+    $("sentence").textContent = S.sentence || "All done. Every sentence is recorded.";
+    const m = state.minutes || 0;
+    $("mins").textContent = `${m.toFixed(1)} of ${GOAL_MIN} min`;
+    $("bar").style.width = `${Math.min(100, (m / GOAL_MIN) * 100)}%`;
+    $("rec").disabled = !S.sentence;
+    $("skip").disabled = !S.sentence;
+  }
+  async function call(path, opts) {
+    const r = await fetch(base + path, opts);
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.error || `The computer answered ${r.status}.`);
+    return data;
+  }
+  async function load() {
+    try { show(await call("state")); }
+    catch (e) { status(`Can't reach your computer: ${e.message} Is better-voice-record still running?`, "err"); }
+  }
+
+  async function micOn() {
+    if (S.ctx) { if (S.ctx.state === "suspended") await S.ctx.resume(); return; }
+    S.stream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: true, channelCount: 1 } });
+    const ctx = (S.ctx = new (window.AudioContext || window.webkitAudioContext)());
+    S.rate = ctx.sampleRate;
+    const src = ctx.createMediaStreamSource(S.stream);
+    const node = (S.node = ctx.createScriptProcessor(4096, 1, 1));
+    node.onaudioprocess = (ev) => {
+      if (!S.recording) return;
+      const f = new Float32Array(ev.inputBuffer.getChannelData(0));
+      S.frames.push(f);
+      let peak = 0; for (let i = 0; i < f.length; i++) peak = Math.max(peak, Math.abs(f[i]));
+      $("level").style.width = `${Math.min(100, peak * 140)}%`;
+    };
+    src.connect(node); node.connect(ctx.destination); // output stays silent
+    if (ctx.state === "suspended") await ctx.resume();
+  }
+  // Mono float frames at the mic's rate -> 16 kHz 16-bit WAV, the format training uses.
+  function toWav(frames, rate) {
+    let n = 0; for (const f of frames) n += f.length;
+    const all = new Float32Array(n); let o = 0; for (const f of frames) { all.set(f, o); o += f.length; }
+    const ratio = rate / 16000, out = Math.floor(n / ratio), buf = new ArrayBuffer(44 + out * 2), v = new DataView(buf);
+    const str = (at, s) => { for (let i = 0; i < 4; i++) v.setUint8(at + i, s.charCodeAt(i)); };
+    str(0, "RIFF"); v.setUint32(4, 36 + out * 2, true); str(8, "WAVE"); str(12, "fmt "); v.setUint32(16, 16, true);
+    v.setUint16(20, 1, true); v.setUint16(22, 1, true); v.setUint32(24, 16000, true); v.setUint32(28, 32000, true);
+    v.setUint16(32, 2, true); v.setUint16(34, 16, true); str(36, "data"); v.setUint32(40, out * 2, true);
+    for (let i = 0; i < out; i++) {
+      const at = i * ratio, j = Math.floor(at), x = all[j] + ((all[j + 1] ?? all[j]) - all[j]) * (at - j);
+      v.setInt16(44 + i * 2, Math.max(-1, Math.min(1, x)) * 0x7fff, true);
+    }
+    return new Blob([buf], { type: "audio/wav" });
+  }
+
+  async function start() {
+    try { await micOn(); }
+    catch (e) {
+      status(e && e.name === "NotAllowedError" ? "The microphone is blocked. Allow it for this page in your browser settings, then reload." : `The microphone didn't start: ${e.message || e}`, "err");
+      return;
+    }
+    try { S.wake = await navigator.wakeLock?.request("screen"); } catch {}
+    S.frames = []; S.recording = true;
+    $("rec").classList.add("on"); $("rec").textContent = "Stop";
+    status("Recording… tap Stop when you finish the sentence.");
+  }
+  async function stop() {
+    S.recording = false; $("level").style.width = "0";
+    $("rec").classList.remove("on"); $("rec").textContent = "Record";
+    const secs = S.frames.reduce((a, f) => a + f.length, 0) / S.rate;
+    if (secs < 0.6) return status("That was too short. Tap Record, read the whole sentence, then tap Stop.", "warn");
+    S.busy = true; $("rec").disabled = true; status("Saving…");
+    try {
+      const r = await call("clip", { method: "POST", headers: { "Content-Type": "audio/wav", "X-Sentence": encodeURIComponent(S.sentence) }, body: toWav(S.frames, S.rate) });
+      S.last = r.file; $("redo").disabled = false;
+      status(r.note || `Saved (${r.seconds.toFixed(1)}s).`, r.note ? "warn" : "ok");
+      show(r.state);
+    } catch (e) { status(`Not saved: ${e.message}`, "err"); $("rec").disabled = false; }
+    S.busy = false;
+  }
+
+  $("rec").addEventListener("click", () => { if (S.busy) return; S.recording ? stop() : start(); });
+  $("skip").addEventListener("click", async () => {
+    if (S.recording || S.busy) return;
+    try { show(await call("skip", { method: "POST", headers: { "X-Sentence": encodeURIComponent(S.sentence) } })); status("Skipped."); }
+    catch (e) { status(e.message, "err"); }
+  });
+  $("redo").addEventListener("click", async () => {
+    if (!S.last || S.recording || S.busy) return;
+    try { show((await call("undo", { method: "POST", headers: { "X-File": S.last } })).state); S.last = null; $("redo").disabled = true; status("Removed. Read it again."); }
+    catch (e) { status(e.message, "err"); }
+  });
+  document.addEventListener("visibilitychange", () => { if (document.hidden && S.recording) stop(); });
+  load();
+})();
+</script>
+</body>
+</html>

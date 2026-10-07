@@ -1,0 +1,78 @@
+# Unsigned for now: Windows shows a SmartScreen warning and macOS needs right-click > Open once.
+# Copied from Handy (github.com/cjpais/Handy .github/workflows/release.yml). Run it from the Actions tab.
+name: "Release"
+
+on: workflow_dispatch
+
+jobs:
+  create-release:
+    permissions:
+      contents: write
+    runs-on: ubuntu-latest
+    outputs:
+      release-id: ${{ steps.create-release.outputs.result }}
+      version: ${{ steps.get-version.outputs.version }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Get version from tauri.conf.json
+        id: get-version
+        shell: bash
+        run: |
+          VERSION=$(grep -o '"version": "[^"]*"' app/src-tauri/tauri.conf.json | cut -d'"' -f4)
+          echo "Application version from tauri.conf.json: $VERSION"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create Draft Release
+        id: create-release
+        uses: actions/github-script@v9
+        with:
+          script: |
+            // Drafts left by failed or cancelled runs would pile up: remove them first.
+            const tag = `v${{ steps.get-version.outputs.version }}`
+            const releases = await github.paginate(github.rest.repos.listReleases, context.repo)
+            for (const r of releases.filter(r => r.draft && r.tag_name === tag)) {
+              await github.rest.repos.deleteRelease({ ...context.repo, release_id: r.id })
+            }
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: `v${{ steps.get-version.outputs.version }}`,
+              name: `v${{ steps.get-version.outputs.version }}`,
+              draft: true,
+              prerelease: false,
+              generate_release_notes: true
+            })
+            return data.id
+
+  publish-tauri:
+    permissions:
+      contents: write
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: "windows-latest"
+            args: ""
+            target: "x86_64-pc-windows-msvc"
+          - platform: "macos-26" # Apple Silicon Macs (M1 and newer)
+            args: "--target aarch64-apple-darwin"
+            target: "aarch64-apple-darwin"
+          - platform: "ubuntu-22.04"
+            args: "--bundles deb"
+            target: "x86_64-unknown-linux-gnu"
+
+    uses: ./.github/workflows/build.yml
+    with:
+      platform: ${{ matrix.platform }}
+      target: ${{ matrix.target }}
+      build-args: ${{ matrix.args }}
+      asset-prefix: "better-voice"
+      upload-artifacts: false
+      release-id: ${{ needs.create-release.outputs.release-id }}
+      # Releases always build from scratch — never restore the Rust cache, so a
+      # stale cached native lib can never be linked into a shipped artifact.
+      no-cache: true
+    secrets: inherit
